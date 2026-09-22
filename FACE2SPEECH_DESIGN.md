@@ -8,9 +8,9 @@ This is a design for a **new text + face -> waveform pipeline**, not a claim tha
 | --- | --- | --- | --- |
 | Speaker encoder | 3-layer LSTM, 256-dimensional normalized speaker vector, GE2E training | No speech encoder; `embeddings.npy` has unknown provenance | Frozen ECAPA-TDNN speaker encoder; use its native 192-dimensional output if using `speechbrain/spkrec-ecapa-voxceleb` |
 | Face encoder | VGG19 trained to predict speech-speaker centroids | No image input or face encoder | Pretrained ResNet backbone plus 192-dimensional projection; train against frozen ECAPA centroids |
-| TTS | Phoneme and speaker-vector conditioned duration/acoustic models, WORLD waveform synthesis | Speaker-ID lookup and synthetic speaker-ID text in `TTS_finetuning.py`; no waveform output | FastSpeech2 conditioned on the same ECAPA vector, trained on real transcribed audio and forced alignments |
+| TTS | Phoneme and speaker-vector conditioned duration/acoustic models, WORLD waveform synthesis | Speaker-ID lookup and synthetic speaker-ID text in `TTS_finetuning.py`; no waveform output | `train_fastspeech2.py` conditions phone, duration, pitch, energy, and mel prediction on the frozen ECAPA space |
 | GAN | None | `trainer.py` changes an existing spectrogram with an embedding | Keep as a separate voice-conversion experiment; it cannot synthesize arbitrary text from a face |
-| Vocoder | WORLD | None | Add a vocoder compatible with the exact mel extraction used for FastSpeech2, such as a matching HiFi-GAN checkpoint |
+| Vocoder | WORLD | None | `synthesize_face.py` uses inverse mel filtering and Griffin-Lim as a waveform baseline; add a mel-matched neural vocoder for quality |
 
 The cited SpeechBrain ECAPA checkpoint uses 80-band filterbanks internally and emits **192-dimensional** embeddings. That is a different contract from the paper's 40-band input and 256-dimensional embedding. A dimension-only adapter cannot preserve speaker-space geometry automatically. Choose **one frozen speech embedding space**, train the face encoder to predict that space, and train TTS with embeddings from that same checkpoint. Do not train the three stages with embeddings from unrelated models.
 
@@ -41,9 +41,9 @@ inference: face crop -> ResNet -> speaker embedding -+
 
 ## Required repository changes
 
-- Replace the speaker-ID lookup and fabricated transcript path in `TTS_finetuning.py` with a manifest-backed transcript, alignment, and acoustic-feature loader. Implement a full speaker-conditioned FastSpeech2 variance adaptor or use a vetted implementation. Save tokenizer, mel, alignment, and speaker-embedding configuration in checkpoints.
+- The new `train_fastspeech2.py` path uses reviewed transcripts, MFA phone alignments, real duration, pitch, energy, log-mel targets, and fixed ECAPA centroids. The older `TTS_finetuning.py` remains an unrelated experimental baseline.
 - The data preparation commands now provide ECAPA centroid extraction and a ResNet18 face encoder trained on the `vox2_meta.csv` identity join. They have not yet been exercised against the full datasets; validate the exported report and run training before using their embeddings downstream.
-- Add a text/phoneme front end, a mel-compatible vocoder, and an inference command that accepts **text plus a face image** and writes a waveform.
+- The new text/phoneme frontend reads the MFA pronunciation dictionary. `synthesize_face.py` accepts **text plus a face image** and writes a waveform using Griffin-Lim. It also accepts a speech centroid for comparison. The dictionary must include the requested words, and a better mel-compatible vocoder remains quality work.
 - Keep `trainer.py`, `gan_model.py`, and `dataloader.py` out of the Face2Speech inference path. They solve spectrogram conversion, a different task.
 - Add held-out-speaker tests for manifest joins, no split leakage, embedding dimensions/norms, duration-to-mel alignment, one TTS train step, and face-to-waveform inference. Compare speech-conditioned and face-conditioned outputs with the same text and TTS/vocoder weights.
 

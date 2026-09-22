@@ -8,6 +8,7 @@ unit-normalized space of extract_ecapa_centroids.py.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,9 @@ def train(args):
     from torch.utils.data import DataLoader, Dataset
 
     joined = load_joined(args.faces, args.centroids)
+    ecapa_config = json.loads(args.ecapa_config.read_text(encoding="utf-8"))
+    if ecapa_config.get("embedding_dim") != EMBEDDING_DIM:
+        raise ValueError("ECAPA configuration has an incompatible embedding dimension")
     training = [row for row in joined if row[2] == "train"]
     validation = [row for row in joined if row[2] == "val"]
     if not training or not validation:
@@ -132,7 +136,7 @@ def train(args):
             best_val = val_cosine
             torch.save({"state_dict": model.state_dict(), "embedding_dim": EMBEDDING_DIM,
                         "backbone": "resnet18", "preprocess": "ResNet18_Weights.DEFAULT.transforms",
-                        "best_val_cosine": best_val}, args.output)
+                        "ecapa_config": ecapa_config, "best_val_cosine": best_val}, args.output)
 
 
 def embed(args):
@@ -167,6 +171,7 @@ def main():
     fit = commands.add_parser("train")
     fit.add_argument("--faces", type=Path, required=True)
     fit.add_argument("--centroids", type=Path, required=True)
+    fit.add_argument("--ecapa-config", type=Path, required=True)
     fit.add_argument("--output", type=Path, required=True)
     fit.add_argument("--epochs", type=int, default=10)
     fit.add_argument("--batch-size", type=int, default=32)

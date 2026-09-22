@@ -1,8 +1,8 @@
 # Face based speech generation experiments
 
-This repository contains two separate research scripts:
+This repository contains a Face2Speech implementation path and two older research scripts:
 
-For the proposed face-image plus text synthesis system using ECAPA-TDNN, ResNet, and FastSpeech2, see [FACE2SPEECH_DESIGN.md](FACE2SPEECH_DESIGN.md). To map VoxCeleb2 audio to cropped VGGFace2 images with `vox2_meta.csv`, prepare mels and transcripts, and train face embeddings, follow [DATA_SETUP.md](DATA_SETUP.md). The scripts below do not yet implement a complete face-to-waveform system.
+For the ECAPA-TDNN, ResNet, and FastSpeech2 face-image plus text synthesis path, see [FACE2SPEECH_DESIGN.md](FACE2SPEECH_DESIGN.md) and the commands in [DATA_SETUP.md](DATA_SETUP.md). That path uses reviewed VoxCeleb2 transcripts, measured phone alignments, and a shared speaker embedding space. The older experiments below are separate from it.
 
 - `trainer.py` trains a conditional GAN that changes a spectrogram using a face embedding. It writes generated spectrograms as NumPy arrays; it does not reconstruct audio.
 - `TTS_finetuning.py` trains a small text to mel spectrogram model on the `acul3/voxceleb2` Hugging Face dataset. VoxCeleb2 does not provide transcripts, so this script uses text made from each speaker ID. Its output is an experimental baseline, not a usable text to speech system.

@@ -78,7 +78,6 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--source", default=DEFAULT_MODEL)
-    parser.add_argument("--revision", help="Resolved Hugging Face checkpoint commit, for provenance")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--min-utterances", type=int, default=3)
     args = parser.parse_args()
@@ -93,7 +92,7 @@ def main() -> None:
         raise ValueError("No speaker has enough utterances for a centroid")
     write_jsonl(args.output_manifest, output)
     (args.output_dir / "ecapa_config.json").write_text(json.dumps({
-        "source": args.source, "revision": args.revision,
+        "source": args.source,
         "sample_rate": SAMPLE_RATE, "embedding_dim": EMBEDDING_DIM,
         "normalization": "unit utterances, mean, unit centroid",
         "min_utterances": args.min_utterances,

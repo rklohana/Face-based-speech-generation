@@ -9,7 +9,7 @@ The [cropped VGGFace2 mirror](https://huggingface.co/datasets/chronopt-research/
 Use Python 3.10 or newer. Install matching `torch`, `torchaudio`, and `torchvision` builds for your device, then:
 
 ```bash
-python -m pip install numpy pillow datasets fsspec faster-whisper speechbrain
+python -m pip install numpy scipy pillow datasets fsspec faster-whisper speechbrain
 ```
 
 Install `ffmpeg` separately and put it on `PATH` to convert MP4 video to WAV. The metadata and manifest scripts use the Python standard library; `export_hf_faces.py` needs `datasets`, Pillow, and fsspec. The large datasets, speech checkpoint, and ResNet weights are downloaded only when the corresponding commands run.
@@ -66,14 +66,38 @@ For multilingual speech, use a multilingual Whisper model and omit `small.en`. T
 
 ## Frozen speech targets and face embeddings
 
-Extract one unit-normalized 192-dimensional ECAPA centroid per speaker from multiple clips, then train ResNet18 on the joined face images. The default [SpeechBrain ECAPA checkpoint](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) is frozen. Store its resolved revision in the command when possible.
+Extract one unit-normalized 192-dimensional ECAPA centroid per speaker from multiple clips, then train ResNet18 on the joined face images. The default [SpeechBrain ECAPA checkpoint](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) is frozen. For reproducibility, use a locally pinned copy of the checkpoint with `--source` and keep `ecapa_config.json` with both trained models.
 
 ```bash
 python -m tools.extract_ecapa_centroids --speech data/manifests/speech.jsonl --output-dir data/ecapa --output-manifest data/manifests/centroids.jsonl --min-utterances 3
-python -m tools.face_encoder train --faces data/manifests/faces.jsonl --centroids data/manifests/centroids.jsonl --output data/checkpoints/face_resnet18.pt --epochs 10
+python -m tools.face_encoder train --faces data/manifests/faces.jsonl --centroids data/manifests/centroids.jsonl --ecapa-config data/ecapa/ecapa_config.json --output data/checkpoints/face_resnet18.pt --epochs 10
 python -m tools.face_encoder embed --faces data/manifests/faces.jsonl --checkpoint data/checkpoints/face_resnet18.pt --output-dir data/face_embeddings --output-manifest data/manifests/face_embeddings.jsonl
 ```
 
 The face model projects 224-pixel crops into the **same 192-dimensional, unit-normalized space** as ECAPA centroids. Its validation score uses speakers absent from training. The face embedding manifest retains the VoxCeleb2 identity and split, so the picture and mel/audio paths can be paired by `speaker_id` without assuming one specific image matches one specific utterance.
 
-These commands prepare paired training records and a face embedding model. A working Face2Speech synthesizer still requires verified transcripts, measured phoneme durations, a speaker-conditioned FastSpeech2 implementation, and a mel-compatible vocoder. See [FACE2SPEECH_DESIGN.md](FACE2SPEECH_DESIGN.md).
+## Forced alignment and FastSpeech2
+
+Install [Montreal Forced Aligner](https://montreal-forced-aligner.readthedocs.io/en/latest/getting_started.html) separately. The example below assumes reviewed English clips and an English ARPAbet acoustic model. Other languages require matching pronunciation and acoustic models. A generated dictionary covers its corpus words; add pronunciations for any new synthesis text before inference.
+
+```bash
+python -m tools.prepare_alignment_corpus --reviewed data/manifests/tts_reviewed.jsonl --corpus-dir data/mfa_corpus --alignment-dir data/mfa_aligned --output-index data/manifests/alignment_index.jsonl
+mfa model download acoustic english_us_arpa
+mfa model download g2p english_us_arpa
+mfa g2p data/mfa_corpus english_us_arpa data/english_lexicon.txt
+mfa align data/mfa_corpus data/english_lexicon.txt english_us_arpa data/mfa_aligned
+python -m tools.prepare_fastspeech2 --alignment-index data/manifests/alignment_index.jsonl --mels data/manifests/speech_mels.jsonl --centroids data/manifests/centroids.jsonl --mel-config data/mels/mel_config.json --output-dir data/tts_features --output-manifest data/manifests/fastspeech2.jsonl --vocabulary data/manifests/phones.json
+```
+
+The adapter rejects missing TextGrids, unreviewed text, mismatched speaker splits, gaps in phone alignment, and phone durations that do not sum to mel frames. It calculates frame pitch and energy from the same WAV as the mel. Inspect alignments and reject poor ones; a passing duration check alone cannot prove the words match the sound.
+
+Train and synthesize with a shared speaker space:
+
+```bash
+python train_fastspeech2.py --manifest data/manifests/fastspeech2.jsonl --vocabulary data/manifests/phones.json --mel-config data/mels/mel_config.json --ecapa-config data/ecapa/ecapa_config.json --output data/checkpoints/fastspeech2.pt
+python synthesize_face.py --text "Hello world" --face data/vggface2_crops/n000140/00000.jpg --face-checkpoint data/checkpoints/face_resnet18.pt --tts-checkpoint data/checkpoints/fastspeech2.pt --lexicon data/english_lexicon.txt --output data/results/hello.wav
+```
+
+To compare with a speech-derived speaker vector using the **same** TTS checkpoint, use `--speech-centroid data/ecapa/id00134.npy` in place of `--face` and `--face-checkpoint`. The inference script currently uses inverse mel filtering and Griffin-Lim phase reconstruction. This produces a baseline waveform; a vocoder trained on the exact `mel_config.json` is still needed for high-quality speech. The text frontend fails clearly on words absent from the pronunciation dictionary or phones absent from the training vocabulary.
+
+The model and end-to-end audio quality still need runtime validation on actual downloaded media. See [FACE2SPEECH_DESIGN.md](FACE2SPEECH_DESIGN.md) for the paper comparison and acceptance criteria.
