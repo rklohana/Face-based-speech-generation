@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 import argparse
+import json
 import os
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
@@ -23,14 +25,20 @@ if torch.cuda.is_available():
 # Global constant: target duration in seconds for each clip
 TARGET_SECONDS = 8
 
-def clip_or_pad(audio_dict, target_seconds=TARGET_SECONDS):
+def clip_or_pad(audio_dict, target_seconds=TARGET_SECONDS, sample_rate=16000):
     """
     Clips or pads the input audio (a dict with keys "array" and "sampling_rate")
     to exactly `target_seconds` seconds.
     """
-    audio = audio_dict["array"]
+    audio = np.asarray(audio_dict["array"])
     sr = audio_dict["sampling_rate"]
-    target_length = int(sr * target_seconds)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1 if audio.shape[0] > audio.shape[1] else 0)
+    if sr != sample_rate:
+        audio = torchaudio.functional.resample(
+            torch.as_tensor(audio, dtype=torch.float32), sr, sample_rate
+        ).numpy()
+    target_length = int(sample_rate * target_seconds)
     if len(audio) > target_length:
         # For training, you might randomly choose a starting point:
         start = random.randint(0, len(audio) - target_length)
@@ -41,7 +49,7 @@ def clip_or_pad(audio_dict, target_seconds=TARGET_SECONDS):
     return audio
 
 # A simple character-level tokenizer
-VOCAB = {ch: idx + 1 for idx, ch in enumerate("abcdefghijklmnopqrstuvwxyz '")}
+VOCAB = {ch: idx + 1 for idx, ch in enumerate("abcdefghijklmnopqrstuvwxyz0123456789 '-_.")}
 VOCAB_SIZE = len(VOCAB) + 1  # reserve index 0 for padding
 
 def tokenize(text):
@@ -49,7 +57,7 @@ def tokenize(text):
     Converts a text string into a list of token ids.
     """
     text = text.lower()
-    return [VOCAB.get(ch, 0) for ch in text]
+    return [VOCAB[ch] for ch in text if ch in VOCAB]
 
 def pad_sequence(seq, max_len, pad_value=0):
     return seq + [pad_value] * (max_len - len(seq))
@@ -66,7 +74,11 @@ class VoxCelebTTSDataset(Dataset):
     def __init__(self, split="train", target_seconds=TARGET_SECONDS):
         self.dataset = load_dataset("acul3/voxceleb2", split=split)
         self.target_seconds = target_seconds
-        # We assume 16kHz audio; adjust sample_rate if necessary.
+        self.speaker_to_idx = {
+            speaker: idx for idx, speaker in enumerate(
+                sorted(str(s) for s in self.dataset.unique("speaker_id"))
+            )
+        }
         self.mel_transform = MelSpectrogram(sample_rate=16000, n_mels=80)
         self.db_transform = AmplitudeToDB()
     
@@ -83,13 +95,13 @@ class VoxCelebTTSDataset(Dataset):
         mel_spec = self.mel_transform(waveform)
         mel_spec = self.db_transform(mel_spec)
         # Create a dummy transcript using the speaker id (or "unknown" if missing)
-        speaker_id = sample.get("speaker_id", "unknown")
+        speaker_id = str(sample["speaker_id"])
         transcript = f"This is speaker {speaker_id} speaking."
         token_ids = tokenize(transcript)
         return {
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "mel_spec": mel_spec.squeeze(0),  # (n_mels, time)
-            "speaker_id": speaker_id
+            "speaker_id": self.speaker_to_idx[speaker_id]
         }
 
 def collate_fn(batch):
@@ -121,16 +133,7 @@ def collate_fn(batch):
         mel_batch.append(mel_padded)
     mel_batch = torch.stack(mel_batch)  # (batch, n_mels, time)
     
-    # Convert speaker id to integer (if not already numeric)
-    speaker_ids = []
-    for item in batch:
-        spk = item["speaker_id"]
-        try:
-            spk_int = int(spk)
-        except:
-            spk_int = 0  # default or use a mapping in a full implementation
-        speaker_ids.append(spk_int)
-    speaker_ids = torch.tensor(speaker_ids, dtype=torch.long)
+    speaker_ids = torch.tensor([item["speaker_id"] for item in batch], dtype=torch.long)
     
     return token_batch, mel_batch, speaker_ids
 
@@ -182,15 +185,15 @@ class DurationPredictor(nn.Module):
         x = self.dropout2(x)
         out = self.linear(x)  # (batch, seq_len, 1)
         out = out.squeeze(-1)  # (batch, seq_len)
-        # Ensure positive durations; add 1.0 to avoid zeros.
-        out = torch.relu(out) + 1.0
+        # Keep durations positive while preserving gradients for negative inputs.
+        out = F.softplus(out) + 1.0
         return out
 
 class LengthRegulator(nn.Module):
     def __init__(self):
         super(LengthRegulator, self).__init__()
     
-    def forward(self, encodings, durations):
+    def forward(self, encodings, durations, padding_mask=None, target_length=None):
         """
         Replicates encoder outputs according to predicted durations.
         Note: This is a simplified implementation.
@@ -198,9 +201,12 @@ class LengthRegulator(nn.Module):
         output = []
         for i in range(encodings.size(0)):
             rep = []
-            for j in range(encodings.size(1)):
-                # Round duration prediction to an integer number of frames
-                repeat = int(round(durations[i, j].item()))
+            valid_length = encodings.size(1) if padding_mask is None else int((~padding_mask[i]).sum().item())
+            for j in range(valid_length):
+                if target_length is None:
+                    repeat = max(1, int(round(durations[i, j].item())))
+                else:
+                    repeat = target_length // valid_length + (j < target_length % valid_length)
                 rep.append(encodings[i, j:j+1].expand(repeat, -1))
             if rep:
                 output.append(torch.cat(rep, dim=0))
@@ -248,7 +254,7 @@ class FastSpeech2(nn.Module):
         # Project speaker embedding to the same dimension as the text encoder output
         self.spk_proj = nn.Linear(speaker_embed_dim, embed_dim)
     
-    def forward(self, text_input, speaker_ids, src_key_padding_mask=None):
+    def forward(self, text_input, speaker_ids, src_key_padding_mask=None, target_mel_length=None):
         # text_input: (batch, seq_len)
         encodings = self.text_encoder(text_input, src_key_padding_mask=src_key_padding_mask)
         # Obtain speaker embedding and project
@@ -259,23 +265,21 @@ class FastSpeech2(nn.Module):
         # Predict token durations
         durations = self.duration_predictor(encodings)  # (batch, seq_len)
         # Length regulation: repeat encoder outputs according to durations
-        regulated = self.length_regulator(encodings, durations)
+        regulated = self.length_regulator(
+            encodings, durations, src_key_padding_mask, target_mel_length
+        )
         # Decode mel spectrogram from regulated representations
         mel_output = self.mel_decoder(regulated)  # (batch, n_mels, time)
         return mel_output, durations
 
-def compute_loss(mel_pred, mel_target, durations_pred):
+def compute_loss(mel_pred, mel_target, durations_pred, token_batch):
     mel_loss = nn.MSELoss()(mel_pred, mel_target)
-    batch_size, _, mel_time = mel_target.shape
-   
-    dummy_target = []
-    for i in range(batch_size):
-        text_len = (mel_target[i].sum(dim=0) != 0).sum().float()
-        target = mel_time / (text_len + 1e-6)
-        dummy_target.append(target)
-    dummy_target = torch.tensor(dummy_target, device=mel_target.device).unsqueeze(1)
-    durations_target = dummy_target.expand_as(durations_pred)
-    duration_loss = nn.L1Loss()(durations_pred, durations_target)
+    valid_tokens = token_batch.ne(0)
+    token_lengths = valid_tokens.sum(dim=1).clamp_min(1)
+    durations_target = (mel_target.size(-1) / token_lengths).unsqueeze(1)
+    duration_loss = F.l1_loss(
+        durations_pred[valid_tokens], durations_target.expand_as(durations_pred)[valid_tokens]
+    )
     return mel_loss + duration_loss
 
 def train(model, dataloader, optimizer, scheduler, device, num_epochs, log_dir="logs"):
@@ -289,8 +293,11 @@ def train(model, dataloader, optimizer, scheduler, device, num_epochs, log_dir="
             speaker_ids = speaker_ids.to(device)     
             
             optimizer.zero_grad()
-            mel_pred, durations_pred = model(token_batch, speaker_ids)
-            loss = compute_loss(mel_pred, mel_batch, durations_pred)
+            padding_mask = token_batch.eq(0)
+            mel_pred, durations_pred = model(
+                token_batch, speaker_ids, padding_mask, mel_batch.size(-1)
+            )
+            loss = compute_loss(mel_pred, mel_batch, durations_pred, token_batch)
             loss.backward()
             
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -314,12 +321,13 @@ def main():
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs and checkpoints")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use for training")
-    parser.add_argument("--num_speakers", type=int, default=1000,
-                        help="Total number of speakers (adjust based on dataset statistics)")
     args = parser.parse_args()
     
     
     dataset = VoxCelebTTSDataset(split="train")
+    os.makedirs(args.log_dir, exist_ok=True)
+    with open(os.path.join(args.log_dir, "speaker_ids.json"), "w", encoding="utf-8") as handle:
+        json.dump(dataset.speaker_to_idx, handle, indent=2)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     
     
@@ -328,7 +336,7 @@ def main():
     speaker_embed_dim = 128
     
     model = FastSpeech2(vocab_size=VOCAB_SIZE, embed_dim=embed_dim, n_mels=n_mels,
-                        num_speakers=args.num_speakers, speaker_embed_dim=speaker_embed_dim)
+                        num_speakers=len(dataset.speaker_to_idx), speaker_embed_dim=speaker_embed_dim)
     model.to(args.device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)

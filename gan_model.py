@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 class ResidualBlock(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -18,10 +17,10 @@ class ResidualBlock(nn.Module):
         return x + self.main(x)
 
 class Generator(nn.Module):
-    def __init__(self, conv_dim=2048, c_dim=512, repeat_num=6):
+    def __init__(self, conv_dim=64, c_dim=512, repeat_num=6):
         super(Generator, self).__init__()
         layers = []
-        layers.append(nn.Conv2d(3 + c_dim, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
+        layers.append(nn.Conv2d(1 + c_dim, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
         layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
         layers.append(nn.ReLU(inplace=True))
         curr_dim = conv_dim
@@ -37,7 +36,7 @@ class Generator(nn.Module):
             layers.append(nn.InstanceNorm2d(curr_dim // 2, affine=True, track_running_stats=True))
             layers.append(nn.ReLU(inplace=True))
             curr_dim //= 2
-        layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
+        layers.append(nn.Conv2d(curr_dim, 1, kernel_size=7, stride=1, padding=3, bias=False))
         layers.append(nn.Tanh())
         self.main = nn.Sequential(*layers)
 
@@ -48,17 +47,19 @@ class Generator(nn.Module):
         return self.main(x)
 
 class Discriminator(nn.Module):
-    def __init__(self, image_size=128, conv_dim=64, c_dim=5, repeat_num=6):
+    def __init__(self, image_size=256, conv_dim=64, c_dim=512, repeat_num=6):
         super(Discriminator, self).__init__()
         layers = []
-        layers.append(nn.Conv2d(3, conv_dim, kernel_size=4, stride=2, padding=1))
+        layers.append(nn.Conv2d(1, conv_dim, kernel_size=4, stride=2, padding=1))
         layers.append(nn.LeakyReLU(0.01))
         curr_dim = conv_dim
         for i in range(1, repeat_num):
             layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1))
             layers.append(nn.LeakyReLU(0.01))
             curr_dim *= 2
-        kernel_size = int(image_size / np.power(2, repeat_num))
+        kernel_size = image_size // (2 ** repeat_num)
+        if kernel_size < 1 or image_size % (2 ** repeat_num):
+            raise ValueError("image_size must be divisible by 2 ** repeat_num")
         self.main = nn.Sequential(*layers)
         self.conv1 = nn.Conv2d(curr_dim, 1, kernel_size=3, stride=1, padding=1, bias=False)
         self.conv2 = nn.Conv2d(curr_dim, c_dim, kernel_size=kernel_size, bias=False)
